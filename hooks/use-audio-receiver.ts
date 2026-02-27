@@ -167,7 +167,7 @@ export function useAudioReceiver() {
 
         if (result) {
             if (result.checksumValid) {
-                const blob = new Blob([result.data], {
+                const blob = new Blob([result.data as any], {
                     type: result.metadata.type || 'application/octet-stream',
                 })
                 const url = URL.createObjectURL(blob)
