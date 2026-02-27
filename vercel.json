@@ -1,16 +1,7 @@
-// vercel.json
 {
     "$schema": "https://openapi.vercel.sh/vercel.json",
     "version": 2,
-    "name": "sonic-transfer",
     "framework": "nextjs",
-    "buildCommand": "npm run build",
-    "devCommand": "npm run dev",
-    "installCommand": "npm install",
-    "outputDirectory": ".next",
-    "regions": [
-        "iad1"
-    ],
     "headers": [
         {
             "source": "/(.*)",
