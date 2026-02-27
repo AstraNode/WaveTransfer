@@ -8,7 +8,7 @@
 
 <div align="center">
 
-[![Visitors](https://visitor-badge.laobi.icu/badge?page_id=astranode.wavetransfer&left_color=1e1b4b&right_color=6d28d9&left_text=visitors&style=flat-square)](https://github.com/yourusername/wavetransfer)&nbsp;
+[![Visitors](https://visitor-badge.laobi.icu/badge?page_id=astranode.wavetransfer&left_color=1e1b4b&right_color=6d28d9&left_text=visitors&style=flat-square)](https://github.com/astranode/wavetransfer)&nbsp;
 [![Stars](https://img.shields.io/github/stars/astranode/wavetransfer?style=flat-square&logo=github&logoColor=white&label=stars&color=6d28d9&labelColor=1e1b4b)](https://github.com/yourusername/wavetransfer/stargazers)&nbsp;
 [![Forks](https://img.shields.io/github/forks/astranode/wavetransfer?style=flat-square&logo=git&logoColor=white&label=forks&color=7c3aed&labelColor=1e1b4b)](https://github.com/yourusername/wavetransfer/network/members)&nbsp;
 [![License](https://img.shields.io/badge/license-MIT-8b5cf6?style=flat-square&labelColor=1e1b4b)](LICENSE)&nbsp;
