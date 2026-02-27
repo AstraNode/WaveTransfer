@@ -5,9 +5,12 @@ import { useCallback, useRef, useState } from 'react'
 import { TransmissionState, FileMetadata } from '@/lib/types'
 import {
     AUDIO_CONFIG,
-    encodeFileToFrame,
-    frameToBitstream,
-    getTotalBits,
+    SYMBOL_FREQS,
+    HANDSHAKE_FREQ,
+    HANDSHAKE_END_FREQ,
+    END_TRANSMISSION_FREQ,
+    END_DURATION,
+    encodeFileToSymbols,
     getEstimatedDuration,
 } from '@/lib/audio-protocol'
 
@@ -15,43 +18,23 @@ export function useAudioTransmitter() {
     const [state, setState] = useState<TransmissionState>({
         status: 'idle',
         progress: 0,
-        currentBit: 0,
-        totalBits: 0,
+        currentSymbol: 0,
+        totalSymbols: 0,
         estimatedTime: 0,
         elapsedTime: 0,
+        effectiveBPS: 0,
     })
 
     const audioContextRef = useRef<AudioContext | null>(null)
-    const oscillatorRef = useRef<OscillatorNode | null>(null)
-    const gainNodeRef = useRef<GainNode | null>(null)
     const isTransmittingRef = useRef(false)
+    const animFrameRef = useRef<number>(0)
     const startTimeRef = useRef(0)
-    const animationFrameRef = useRef<number>(0)
 
     const cleanup = useCallback(() => {
         isTransmittingRef.current = false
-
-        if (animationFrameRef.current) {
-            cancelAnimationFrame(animationFrameRef.current)
-        }
-
-        if (oscillatorRef.current) {
-            try {
-                oscillatorRef.current.stop()
-                oscillatorRef.current.disconnect()
-            } catch (e) {
-                // Already stopped
-            }
-            oscillatorRef.current = null
-        }
-
-        if (gainNodeRef.current) {
-            gainNodeRef.current.disconnect()
-            gainNodeRef.current = null
-        }
-
+        if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current)
         if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-            audioContextRef.current.close()
+            try { audioContextRef.current.close() } catch { }
             audioContextRef.current = null
         }
     }, [])
@@ -60,126 +43,127 @@ export function useAudioTransmitter() {
         fileData: Uint8Array,
         metadata: FileMetadata
     ): Promise<void> => {
-        // Clean up any previous transmission
         cleanup()
 
         return new Promise<void>((resolve, reject) => {
             try {
-                // Initialize AudioContext after user interaction
-                const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)()
-                audioContextRef.current = audioContext
+                const AudioCtx = window.AudioContext || (window as any).webkitAudioContext
+                const ctx = new AudioCtx({ sampleRate: AUDIO_CONFIG.sampleRate })
+                audioContextRef.current = ctx
+
+                // Encode file to symbol stream
+                const symbols = encodeFileToSymbols(fileData, metadata)
+                const totalSymbols = symbols.length
+                const estimatedTime = getEstimatedDuration(metadata)
 
                 setState({
-                    status: 'preparing',
+                    status: 'handshake',
                     progress: 0,
-                    currentBit: 0,
-                    totalBits: 0,
-                    estimatedTime: 0,
+                    currentSymbol: 0,
+                    totalSymbols,
+                    estimatedTime,
                     elapsedTime: 0,
+                    effectiveBPS: AUDIO_CONFIG.effectiveBPS,
                 })
 
-                // Encode file to protocol frame
-                const frame = encodeFileToFrame(fileData, metadata)
-                const bitstream = frameToBitstream(frame)
-                const totalBits = bitstream.length
-                const estimatedTime = getEstimatedDuration(totalBits)
-                const bitDuration = AUDIO_CONFIG.bitDuration
-
-                setState(prev => ({
-                    ...prev,
-                    totalBits,
-                    estimatedTime,
-                    status: 'transmitting',
-                }))
-
-                // Create oscillator and gain node
-                const oscillator = audioContext.createOscillator()
-                const gainNode = audioContext.createGain()
-
-                oscillator.type = 'sine'
-                oscillator.connect(gainNode)
-                gainNode.connect(audioContext.destination)
-
-                // Set initial gain
-                gainNode.gain.setValueAtTime(0.5, audioContext.currentTime)
-
-                oscillatorRef.current = oscillator
-                gainNodeRef.current = gainNode
                 isTransmittingRef.current = true
 
-                // Schedule all frequency changes
-                const startTime = audioContext.currentTime + 0.05 // Small buffer
-                startTimeRef.current = performance.now()
+                // ── Build the audio schedule ──
+                const osc = ctx.createOscillator()
+                const gain = ctx.createGain()
+                osc.type = 'sine'
+                osc.connect(gain)
+                gain.connect(ctx.destination)
 
-                // Smooth ramp duration for each bit transition
-                const rampTime = AUDIO_CONFIG.rampDuration
+                let t = ctx.currentTime + 0.05
 
-                for (let i = 0; i < bitstream.length; i++) {
-                    const bitTime = startTime + i * bitDuration
-                    const freq = bitstream[i] === 1 ? AUDIO_CONFIG.markFreq : AUDIO_CONFIG.spaceFreq
+                // 1) HANDSHAKE: 1 second continuous tone
+                const handshakeStart = t
+                osc.frequency.setValueAtTime(HANDSHAKE_FREQ, t)
+                gain.gain.setValueAtTime(0, t)
+                gain.gain.linearRampToValueAtTime(0.6, t + 0.05)
+                t += AUDIO_CONFIG.handshakeDuration
 
-                    // Smooth frequency transition
-                    oscillator.frequency.setValueAtTime(freq, bitTime)
+                // 2) HANDSHAKE END: short different tone to signal "data starts"
+                osc.frequency.setValueAtTime(HANDSHAKE_END_FREQ, t)
+                gain.gain.setValueAtTime(0.6, t)
+                t += AUDIO_CONFIG.handshakeEndDuration
 
-                    // Slight volume dip at transitions for cleaner signal
-                    if (i > 0) {
-                        gainNode.gain.setValueAtTime(0.3, bitTime)
-                        gainNode.gain.linearRampToValueAtTime(0.5, bitTime + rampTime)
-                    }
+                // Small gap
+                gain.gain.setValueAtTime(0, t)
+                t += 0.05
+                gain.gain.setValueAtTime(0.6, t)
+
+                const dataStartTime = t
+
+                // 3) DATA: each symbol is one frequency for symbolDuration
+                const symDur = AUDIO_CONFIG.symbolDuration
+                for (let i = 0; i < symbols.length; i++) {
+                    const freq = SYMBOL_FREQS[symbols[i]]
+                    osc.frequency.setValueAtTime(freq, t)
+                    // Tiny ramp to avoid click
+                    gain.gain.setValueAtTime(0.55, t)
+                    gain.gain.linearRampToValueAtTime(0.6, t + 0.0005)
+                    t += symDur
                 }
 
-                // Schedule end: silence after all bits
-                const endTime = startTime + totalBits * bitDuration
-                gainNode.gain.setValueAtTime(0.5, endTime)
-                gainNode.gain.linearRampToValueAtTime(0, endTime + 0.05)
+                // 4) END MARKER: distinct frequency for 0.5s
+                gain.gain.setValueAtTime(0.6, t)
+                osc.frequency.setValueAtTime(END_TRANSMISSION_FREQ, t)
+                t += END_DURATION
 
-                // Start oscillator
-                oscillator.start(startTime)
-                oscillator.stop(endTime + 0.1)
+                // Fade out
+                gain.gain.linearRampToValueAtTime(0, t + 0.05)
+                t += 0.1
 
-                // Progress update loop
+                // Start and schedule stop
+                osc.start(handshakeStart)
+                osc.stop(t)
+
+                // ── Progress tracking ──
+                startTimeRef.current = performance.now()
+
                 const updateProgress = () => {
                     if (!isTransmittingRef.current) return
 
                     const elapsed = (performance.now() - startTimeRef.current) / 1000
-                    const currentBit = Math.min(
-                        Math.floor(elapsed / bitDuration),
-                        totalBits
+                    const handshakeTotal = AUDIO_CONFIG.handshakeDuration + AUDIO_CONFIG.handshakeEndDuration + 0.05
+                    const dataElapsed = Math.max(0, elapsed - handshakeTotal)
+                    const currentSymbol = Math.min(
+                        Math.floor(dataElapsed / symDur),
+                        totalSymbols
                     )
-                    const progress = Math.min((currentBit / totalBits) * 100, 100)
+                    const progress = Math.min((currentSymbol / totalSymbols) * 100, 100)
 
                     setState(prev => ({
                         ...prev,
-                        currentBit,
+                        status: elapsed < handshakeTotal ? 'handshake' : 'transmitting',
+                        currentSymbol,
                         progress,
                         elapsedTime: elapsed,
                     }))
 
-                    if (currentBit < totalBits) {
-                        animationFrameRef.current = requestAnimationFrame(updateProgress)
+                    if (elapsed < t - handshakeStart + 0.5) {
+                        animFrameRef.current = requestAnimationFrame(updateProgress)
                     }
                 }
 
-                animationFrameRef.current = requestAnimationFrame(updateProgress)
+                animFrameRef.current = requestAnimationFrame(updateProgress)
 
-                // Handle completion
-                oscillator.onended = () => {
+                osc.onended = () => {
                     isTransmittingRef.current = false
                     setState(prev => ({
                         ...prev,
                         status: 'complete',
                         progress: 100,
-                        currentBit: totalBits,
+                        currentSymbol: totalSymbols,
                     }))
                     cleanup()
                     resolve()
                 }
             } catch (error) {
                 cleanup()
-                setState(prev => ({
-                    ...prev,
-                    status: 'error',
-                }))
+                setState(prev => ({ ...prev, status: 'error' }))
                 reject(error)
             }
         })
@@ -190,10 +174,11 @@ export function useAudioTransmitter() {
         setState({
             status: 'idle',
             progress: 0,
-            currentBit: 0,
-            totalBits: 0,
+            currentSymbol: 0,
+            totalSymbols: 0,
             estimatedTime: 0,
             elapsedTime: 0,
+            effectiveBPS: 0,
         })
     }, [cleanup])
 
@@ -201,17 +186,13 @@ export function useAudioTransmitter() {
         setState({
             status: 'idle',
             progress: 0,
-            currentBit: 0,
-            totalBits: 0,
+            currentSymbol: 0,
+            totalSymbols: 0,
             estimatedTime: 0,
             elapsedTime: 0,
+            effectiveBPS: 0,
         })
     }, [])
 
-    return {
-        state,
-        transmit,
-        cancel,
-        reset,
-    }
+    return { state, transmit, cancel, reset }
 }

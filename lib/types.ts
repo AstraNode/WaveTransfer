@@ -6,41 +6,38 @@ export interface FileMetadata {
 }
 
 export interface TransmissionState {
-    status: 'idle' | 'preparing' | 'transmitting' | 'complete' | 'error'
+    status: 'idle' | 'handshake' | 'transmitting' | 'complete' | 'error'
     progress: number
-    currentBit: number
-    totalBits: number
+    currentSymbol: number
+    totalSymbols: number
     estimatedTime: number
     elapsedTime: number
+    effectiveBPS: number
 }
 
 export interface ReceiverState {
-    status: 'idle' | 'listening' | 'syncing' | 'receiving_header' | 'receiving_payload' | 'verifying' | 'complete' | 'error'
+    status: 'idle' | 'listening' | 'handshake_detected' | 'receiving' | 'verifying' | 'complete' | 'error'
     progress: number
-    bitsReceived: number
-    totalBitsExpected: number
+    symbolsReceived: number
+    totalSymbolsExpected: number
     signalStrength: number
     metadata: FileMetadata | null
     errorMessage?: string
 }
 
-export interface ProtocolFrame {
-    preamble: number[]
-    header: number[]
-    payload: number[]
-    checksum: number
-    endMarker: number[]
-}
-
 export interface AudioConfig {
-    spaceFreq: number
-    markFreq: number
-    baudRate: number
     sampleRate: number
-    preambleLength: number
-    syncPatternLength: number
-    bitDuration: number
+    handshakeFreq: number
+    handshakeDuration: number
+    handshakeEndFreq: number
+    handshakeEndDuration: number
+    baseFreq: number
+    freqStep: number
+    symbolRate: number
+    bitsPerSymbol: number
+    symbolDuration: number
     rampDuration: number
+    effectiveBPS: number
 }
 
 export interface DecodedFile {

@@ -5,21 +5,21 @@ import { useCallback, useRef, useState, useEffect } from 'react'
 import { ReceiverState, DecodedFile } from '@/lib/types'
 import {
     AUDIO_CONFIG,
-    detectFSKBit,
-    detectPreamble,
-    detectSyncWord,
-    detectEndMarker,
-    decodeReceivedBits,
+    detectSymbol,
+    detectHandshake,
+    detectHandshakeEnd,
+    detectEndTransmission,
+    decodeSymbolsToFile,
 } from '@/lib/audio-protocol'
 
-export type MicPermissionState = 'unknown' | 'granted' | 'denied' | 'prompt'
+export type MicPermissionState = 'unknown' | 'granted' | 'denied'
 
 export function useAudioReceiver() {
     const [state, setState] = useState<ReceiverState>({
         status: 'idle',
         progress: 0,
-        bitsReceived: 0,
-        totalBitsExpected: 0,
+        symbolsReceived: 0,
+        totalSymbolsExpected: 0,
         signalStrength: 0,
         metadata: null,
     })
@@ -35,420 +35,316 @@ export function useAudioReceiver() {
     const processorRef = useRef<ScriptProcessorNode | null>(null)
     const isListeningRef = useRef(false)
 
-    const receiverPhaseRef = useRef<'idle' | 'detecting_preamble' | 'detecting_sync' | 'receiving_data' | 'done'>('idle')
-    const recentBitsRef = useRef<number[]>([])
-    const dataBitsRef = useRef<number[]>([])
+    const phaseRef = useRef<'waiting_handshake' | 'in_handshake' | 'waiting_data' | 'receiving_data' | 'done'>('waiting_handshake')
+    const symbolsRef = useRef<number[]>([])
+    const handshakeCountRef = useRef(0)
     const silenceCountRef = useRef(0)
+    const metadataRef = useRef<{ name: string; type: string; size: number } | null>(null)
 
-    // ────────────────────────────────────────────
-    // Safe permission check — never blocks, never throws
-    // ────────────────────────────────────────────
     const checkMicrophonePermission = useCallback(async () => {
-        // Try Permissions API first (non-blocking check)
         try {
             if (navigator?.permissions?.query) {
-                const result = await navigator.permissions.query(
-                    { name: 'microphone' as PermissionName }
-                )
-                setMicPermission(result.state as MicPermissionState)
-
+                const result = await navigator.permissions.query({ name: 'microphone' as PermissionName })
+                setMicPermission(result.state === 'granted' ? 'granted' : result.state === 'denied' ? 'denied' : 'unknown')
                 result.addEventListener('change', () => {
-                    setMicPermission(result.state as MicPermissionState)
+                    setMicPermission(result.state === 'granted' ? 'granted' : result.state === 'denied' ? 'denied' : 'unknown')
                 })
-                return
             }
         } catch {
-            // Permissions API doesn't support microphone query — totally fine
+            setMicPermission('unknown')
         }
-
-        // If we can't query, just set to 'unknown' — we'll ask when user clicks
-        setMicPermission('unknown')
     }, [])
 
-    useEffect(() => {
-        checkMicrophonePermission()
-    }, [checkMicrophonePermission])
+    useEffect(() => { checkMicrophonePermission() }, [checkMicrophonePermission])
 
-    // ────────────────────────────────────────────
-    // Cleanup
-    // ────────────────────────────────────────────
     const cleanup = useCallback(() => {
         isListeningRef.current = false
-        receiverPhaseRef.current = 'idle'
-        recentBitsRef.current = []
-        dataBitsRef.current = []
+        phaseRef.current = 'waiting_handshake'
+        symbolsRef.current = []
+        handshakeCountRef.current = 0
+        silenceCountRef.current = 0
+        metadataRef.current = null
 
-        if (processorRef.current) {
-            try { processorRef.current.disconnect() } catch { }
-            processorRef.current = null
-        }
-
-        if (sourceNodeRef.current) {
-            try { sourceNodeRef.current.disconnect() } catch { }
-            sourceNodeRef.current = null
-        }
-
-        if (analyserRef.current) {
-            try { analyserRef.current.disconnect() } catch { }
-            analyserRef.current = null
-            setAnalyserNode(null)
-        }
-
-        if (mediaStreamRef.current) {
-            mediaStreamRef.current.getTracks().forEach(track => track.stop())
-            mediaStreamRef.current = null
-        }
-
-        if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-            try { audioContextRef.current.close() } catch { }
-            audioContextRef.current = null
-        }
+        if (processorRef.current) { try { processorRef.current.disconnect() } catch { } processorRef.current = null }
+        if (sourceNodeRef.current) { try { sourceNodeRef.current.disconnect() } catch { } sourceNodeRef.current = null }
+        if (analyserRef.current) { try { analyserRef.current.disconnect() } catch { } analyserRef.current = null; setAnalyserNode(null) }
+        if (mediaStreamRef.current) { mediaStreamRef.current.getTracks().forEach(t => t.stop()); mediaStreamRef.current = null }
+        if (audioContextRef.current && audioContextRef.current.state !== 'closed') { try { audioContextRef.current.close() } catch { } audioContextRef.current = null }
     }, [])
 
-    useEffect(() => {
-        return () => { cleanup() }
-    }, [cleanup])
+    useEffect(() => () => { cleanup() }, [cleanup])
 
-    // ────────────────────────────────────────────
-    // Try parse header
-    // ────────────────────────────────────────────
-    const tryParseHeader = useCallback(() => {
+    // ── Try to parse metadata from received symbols ──
+    const tryParseMetadata = useCallback(() => {
+        if (metadataRef.current) return // Already parsed
+
+        const syms = symbolsRef.current
+        if (syms.length < 10) return
+
+        const byteCount = Math.floor(syms.length / 2)
+        const bytes = new Uint8Array(byteCount)
+        for (let i = 0; i < byteCount; i++) {
+            bytes[i] = ((syms[i * 2] & 0x0F) << 4) | (syms[i * 2 + 1] & 0x0F)
+        }
+
         try {
-            const bits = dataBitsRef.current
-            const bytes = new Uint8Array(Math.floor(bits.length / 8))
-            for (let i = 0; i < bytes.length; i++) {
-                let byte = 0
-                for (let j = 0; j < 8; j++) {
-                    byte = (byte << 1) | bits[i * 8 + j]
-                }
-                bytes[i] = byte
-            }
-
-            const decoded = new TextDecoder().decode(bytes)
+            const decoded = new TextDecoder('utf-8', { fatal: false }).decode(bytes)
             const headerEndIdx = decoded.indexOf(String.fromCharCode(0x1E))
             if (headerEndIdx === -1) return
 
-            const headerStr = decoded.substring(0, headerEndIdx)
-            const fields = headerStr.split(String.fromCharCode(0x1F))
+            const fields = decoded.substring(0, headerEndIdx).split(String.fromCharCode(0x1F))
             if (fields.length < 3) return
 
-            const metadata = {
-                name: fields[0],
-                type: fields[1],
-                size: parseInt(fields[2], 10),
-            }
+            const size = parseInt(fields[2], 10)
+            if (isNaN(size) || size <= 0) return
 
-            if (!isNaN(metadata.size) && metadata.size > 0) {
-                const headerBits = (headerEndIdx + 1) * 8
-                const totalExpected = headerBits + metadata.size * 8 + 8
+            const meta = { name: fields[0], type: fields[1], size }
+            metadataRef.current = meta
 
-                setState(prev => ({
-                    ...prev,
-                    status: 'receiving_payload',
-                    metadata,
-                    totalBitsExpected: totalExpected,
-                }))
-            }
-        } catch {
-            // Not complete yet
-        }
+            const headerBytes = new TextEncoder().encode(decoded.substring(0, headerEndIdx + 1)).length
+            const totalSymbols = (headerBytes + size + 1) * 2 // +1 for CRC
+
+            setState(prev => ({
+                ...prev,
+                metadata: meta,
+                totalSymbolsExpected: totalSymbols,
+            }))
+        } catch { }
     }, [])
 
-    // ────────────────────────────────────────────
-    // Finish receiving
-    // ────────────────────────────────────────────
+    // ── Finish and decode ──
     const finishReceiving = useCallback(() => {
-        receiverPhaseRef.current = 'done'
+        phaseRef.current = 'done'
         isListeningRef.current = false
 
         setState(prev => ({ ...prev, status: 'verifying' }))
 
-        const result = decodeReceivedBits(dataBitsRef.current)
+        const result = decodeSymbolsToFile(symbolsRef.current)
 
         if (result) {
             if (result.checksumValid) {
-                const blob = new Blob([result.data as any], {
-                    type: result.metadata.type || 'application/octet-stream',
-                })
+                const blob = new Blob([result.data], { type: result.metadata.type || 'application/octet-stream' })
                 const url = URL.createObjectURL(blob)
-
                 setDecodedFile({ metadata: result.metadata, data: result.data, blob, url })
-                setState(prev => ({
-                    ...prev,
-                    status: 'complete',
-                    progress: 100,
-                    metadata: result.metadata,
-                }))
+                setState(prev => ({ ...prev, status: 'complete', progress: 100, metadata: result.metadata }))
             } else {
-                setState(prev => ({
-                    ...prev,
-                    status: 'error',
-                    errorMessage: 'Checksum verification failed. Data may be corrupted.',
-                }))
+                setState(prev => ({ ...prev, status: 'error', errorMessage: 'Checksum failed. Move devices closer and try again.' }))
             }
         } else {
-            setState(prev => ({
-                ...prev,
-                status: 'error',
-                errorMessage: 'Failed to decode received data.',
-            }))
+            setState(prev => ({ ...prev, status: 'error', errorMessage: 'Could not decode data. Transmission may be incomplete.' }))
         }
 
         if (processorRef.current) try { processorRef.current.disconnect() } catch { }
         if (sourceNodeRef.current) try { sourceNodeRef.current.disconnect() } catch { }
-        if (mediaStreamRef.current) {
-            mediaStreamRef.current.getTracks().forEach(track => track.stop())
-        }
+        if (mediaStreamRef.current) mediaStreamRef.current.getTracks().forEach(t => t.stop())
     }, [])
 
-    // ────────────────────────────────────────────
-    // Process one bit window
-    // ────────────────────────────────────────────
-    const processOneBitWindow = useCallback(
-        (samples: Float32Array, sampleRate: number) => {
-            const { bit, confidence, signalStrength } = detectFSKBit(samples, sampleRate)
-
-            setState(prev => ({
-                ...prev,
-                signalStrength: Math.min(signalStrength * 10, 1),
-            }))
-
-            if (bit === -1 || confidence < 0.15) {
-                silenceCountRef.current++
-                if (silenceCountRef.current > 20 && receiverPhaseRef.current === 'receiving_data') {
-                    finishReceiving()
+    // ── Process audio window ──
+    const processWindow = useCallback((samples: Float32Array, sampleRate: number) => {
+        switch (phaseRef.current) {
+            case 'waiting_handshake': {
+                const { detected, power } = detectHandshake(samples, sampleRate)
+                setState(prev => ({ ...prev, signalStrength: Math.min(power * 5, 1) }))
+                if (detected) {
+                    handshakeCountRef.current++
+                    // Need several consecutive detections to confirm
+                    if (handshakeCountRef.current > 5) {
+                        phaseRef.current = 'in_handshake'
+                        setState(prev => ({ ...prev, status: 'handshake_detected' }))
+                    }
+                } else {
+                    handshakeCountRef.current = Math.max(0, handshakeCountRef.current - 1)
                 }
-                return
+                break
             }
 
-            silenceCountRef.current = 0
+            case 'in_handshake': {
+                // Wait for handshake end tone
+                if (detectHandshakeEnd(samples, sampleRate)) {
+                    phaseRef.current = 'waiting_data'
+                    silenceCountRef.current = 0
+                }
+                break
+            }
 
-            switch (receiverPhaseRef.current) {
-                case 'detecting_preamble':
-                    recentBitsRef.current.push(bit)
-                    if (recentBitsRef.current.length > 100) {
-                        recentBitsRef.current = recentBitsRef.current.slice(-100)
-                    }
-                    if (detectPreamble(recentBitsRef.current, 12)) {
-                        setState(prev => ({ ...prev, status: 'syncing' }))
-                        receiverPhaseRef.current = 'detecting_sync'
-                    }
-                    break
+            case 'waiting_data': {
+                // Small gap after handshake end, then data starts
+                silenceCountRef.current++
+                if (silenceCountRef.current > 3) {
+                    phaseRef.current = 'receiving_data'
+                    symbolsRef.current = []
+                    silenceCountRef.current = 0
+                    setState(prev => ({ ...prev, status: 'receiving' }))
+                }
+                break
+            }
 
-                case 'detecting_sync':
-                    recentBitsRef.current.push(bit)
-                    if (recentBitsRef.current.length > 100) {
-                        recentBitsRef.current = recentBitsRef.current.slice(-100)
-                    }
-                    if (detectSyncWord(recentBitsRef.current)) {
-                        receiverPhaseRef.current = 'receiving_data'
-                        dataBitsRef.current = []
-                        recentBitsRef.current = []
-                        setState(prev => ({ ...prev, status: 'receiving_header' }))
-                    }
-                    break
-
-                case 'receiving_data':
-                    dataBitsRef.current.push(bit)
-                    recentBitsRef.current.push(bit)
-                    if (recentBitsRef.current.length > 50) {
-                        recentBitsRef.current = recentBitsRef.current.slice(-50)
-                    }
-
-                    if (dataBitsRef.current.length > 24 && detectEndMarker(recentBitsRef.current)) {
-                        dataBitsRef.current = dataBitsRef.current.slice(0, -16)
+            case 'receiving_data': {
+                // Check for end of transmission
+                if (detectEndTransmission(samples, sampleRate)) {
+                    silenceCountRef.current++
+                    if (silenceCountRef.current > 3) {
                         finishReceiving()
                         return
                     }
+                } else {
+                    silenceCountRef.current = 0
+                }
 
-                    if (dataBitsRef.current.length > 0 && dataBitsRef.current.length % 8 === 0) {
-                        tryParseHeader()
+                const { symbol, confidence, power } = detectSymbol(samples, sampleRate)
+                setState(prev => ({ ...prev, signalStrength: Math.min(power * 5, 1) }))
+
+                if (symbol >= 0 && confidence > 0.2 && power > 0.01) {
+                    symbolsRef.current.push(symbol)
+
+                    // Try parsing metadata periodically
+                    if (symbolsRef.current.length % 20 === 0) {
+                        tryParseMetadata()
                     }
 
                     setState(prev => ({
                         ...prev,
-                        bitsReceived: dataBitsRef.current.length,
-                        progress: prev.totalBitsExpected > 0
-                            ? Math.min((dataBitsRef.current.length / prev.totalBitsExpected) * 100, 99)
+                        symbolsReceived: symbolsRef.current.length,
+                        progress: prev.totalSymbolsExpected > 0
+                            ? Math.min((symbolsRef.current.length / prev.totalSymbolsExpected) * 100, 99)
                             : 0,
                     }))
-                    break
+                }
+                break
             }
-        },
-        [finishReceiving, tryParseHeader]
-    )
+        }
+    }, [finishReceiving, tryParseMetadata])
 
-    // ────────────────────────────────────────────
-    // Start listening — requests mic directly on click
-    // ────────────────────────────────────────────
+    // ── Start listening ──
     const startListening = useCallback(async () => {
         cleanup()
         setDecodedFile(null)
-
-        // Reset state to show we're trying
         setState({
             status: 'idle',
             progress: 0,
-            bitsReceived: 0,
-            totalBitsExpected: 0,
+            symbolsReceived: 0,
+            totalSymbolsExpected: 0,
             signalStrength: 0,
             metadata: null,
         })
 
-        // Step 1: Request microphone — this IS the permission prompt
         let stream: MediaStream
         try {
             stream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    echoCancellation: false,
-                    noiseSuppression: false,
-                    autoGainControl: false,
-                },
+                audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
             })
         } catch (error: any) {
-            console.error('Mic error:', error)
-
-            let errorMessage: string
-            const errorName = error?.name || ''
-
-            switch (errorName) {
-                case 'NotAllowedError':
-                case 'PermissionDeniedError':
-                    setMicPermission('denied')
-                    errorMessage = 'Microphone access was denied. Please allow it in your browser settings (click the lock icon in the address bar) and try again.'
-                    break
-                case 'NotFoundError':
-                case 'DevicesNotFoundError':
-                    errorMessage = 'No microphone found. Please connect a microphone and try again.'
-                    break
-                case 'NotReadableError':
-                case 'TrackStartError':
-                    errorMessage = 'Microphone is in use by another app. Close other apps using the mic and try again.'
-                    break
-                case 'OverconstrainedError':
-                    errorMessage = 'Microphone does not support the required settings. Retrying with defaults...'
-                    break
-                default:
-                    errorMessage = `Microphone error: ${error?.message || 'Unknown error. Make sure you are on HTTPS or localhost.'}`
+            const name = error?.name || ''
+            let msg: string
+            if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+                setMicPermission('denied')
+                msg = 'Microphone access denied. Click the lock icon in your address bar to allow it.'
+            } else if (name === 'NotFoundError') {
+                msg = 'No microphone found. Connect one and try again.'
+            } else if (name === 'NotReadableError') {
+                msg = 'Microphone busy. Close other apps using it.'
+            } else {
+                msg = `Mic error: ${error?.message || 'Unknown. Use HTTPS or localhost.'}`
             }
-
-            setState(prev => ({ ...prev, status: 'error', errorMessage }))
+            setState(prev => ({ ...prev, status: 'error', errorMessage: msg }))
             return
         }
 
-        // If we got here, permission was granted!
         setMicPermission('granted')
         mediaStreamRef.current = stream
 
         try {
-            // Step 2: Set up audio processing
             const AudioCtx = window.AudioContext || (window as any).webkitAudioContext
-            const audioContext = new AudioCtx({ sampleRate: AUDIO_CONFIG.sampleRate })
-            audioContextRef.current = audioContext
+            const ctx = new AudioCtx({ sampleRate: AUDIO_CONFIG.sampleRate })
+            audioContextRef.current = ctx
+            if (ctx.state === 'suspended') await ctx.resume()
 
-            if (audioContext.state === 'suspended') {
-                await audioContext.resume()
-            }
+            const source = ctx.createMediaStreamSource(stream)
+            sourceNodeRef.current = source
 
-            const sourceNode = audioContext.createMediaStreamSource(stream)
-            sourceNodeRef.current = sourceNode
-
-            const analyser = audioContext.createAnalyser()
+            const analyser = ctx.createAnalyser()
             analyser.fftSize = 2048
-            analyser.smoothingTimeConstant = 0.3
+            analyser.smoothingTimeConstant = 0.2
             analyserRef.current = analyser
             setAnalyserNode(analyser)
-            sourceNode.connect(analyser)
+            source.connect(analyser)
 
-            const sampleRate = audioContext.sampleRate
-            const samplesPerBit = Math.round(sampleRate * AUDIO_CONFIG.bitDuration)
-            const bufferSize = 1024
-            const processor = audioContext.createScriptProcessor(bufferSize, 1, 1)
+            const sampleRate = ctx.sampleRate
+            const samplesPerSymbol = Math.round(sampleRate * AUDIO_CONFIG.symbolDuration)
+            const bufferSize = 2048
+            const processor = ctx.createScriptProcessor(bufferSize, 1, 1)
             processorRef.current = processor
 
             isListeningRef.current = true
-            receiverPhaseRef.current = 'detecting_preamble'
-            recentBitsRef.current = []
-            dataBitsRef.current = []
+            phaseRef.current = 'waiting_handshake'
+            symbolsRef.current = []
+            handshakeCountRef.current = 0
             silenceCountRef.current = 0
+            metadataRef.current = null
 
             let accumulator = new Float32Array(0)
 
             processor.onaudioprocess = (event: AudioProcessingEvent) => {
                 if (!isListeningRef.current) return
 
-                const inputData = event.inputBuffer.getChannelData(0)
-                const outputData = event.outputBuffer.getChannelData(0)
-                outputData.set(inputData)
+                const input = event.inputBuffer.getChannelData(0)
+                const output = event.outputBuffer.getChannelData(0)
+                output.set(input)
 
-                const newAcc = new Float32Array(accumulator.length + inputData.length)
+                // During handshake detection, use larger windows
+                if (phaseRef.current === 'waiting_handshake' || phaseRef.current === 'in_handshake' || phaseRef.current === 'waiting_data') {
+                    processWindow(input, sampleRate)
+                    return
+                }
+
+                // During data reception, accumulate exact symbol-length windows
+                const newAcc = new Float32Array(accumulator.length + input.length)
                 newAcc.set(accumulator)
-                newAcc.set(inputData, accumulator.length)
+                newAcc.set(input, accumulator.length)
                 accumulator = newAcc
 
-                while (accumulator.length >= samplesPerBit) {
-                    const bitSamples = accumulator.slice(0, samplesPerBit)
-                    accumulator = accumulator.slice(samplesPerBit)
-                    processOneBitWindow(bitSamples, sampleRate)
+                while (accumulator.length >= samplesPerSymbol) {
+                    const symbolSamples = accumulator.slice(0, samplesPerSymbol)
+                    accumulator = accumulator.slice(samplesPerSymbol)
+                    processWindow(symbolSamples, sampleRate)
                 }
             }
 
-            sourceNode.connect(processor)
-            processor.connect(audioContext.destination)
+            source.connect(processor)
+            processor.connect(ctx.destination)
 
             setState({
                 status: 'listening',
                 progress: 0,
-                bitsReceived: 0,
-                totalBitsExpected: 0,
+                symbolsReceived: 0,
+                totalSymbolsExpected: 0,
                 signalStrength: 0,
                 metadata: null,
             })
         } catch (error: any) {
-            console.error('Audio setup error:', error)
             cleanup()
             setState(prev => ({
                 ...prev,
                 status: 'error',
-                errorMessage: `Audio setup failed: ${error?.message || 'Unknown error'}`,
+                errorMessage: `Audio setup failed: ${error?.message || 'Unknown'}`,
             }))
         }
-    }, [cleanup, processOneBitWindow])
+    }, [cleanup, processWindow])
 
     const stopListening = useCallback(() => {
         cleanup()
-        setState({
-            status: 'idle',
-            progress: 0,
-            bitsReceived: 0,
-            totalBitsExpected: 0,
-            signalStrength: 0,
-            metadata: null,
-        })
+        setState({ status: 'idle', progress: 0, symbolsReceived: 0, totalSymbolsExpected: 0, signalStrength: 0, metadata: null })
         setDecodedFile(null)
     }, [cleanup])
 
     const reset = useCallback(() => {
         cleanup()
-        setState({
-            status: 'idle',
-            progress: 0,
-            bitsReceived: 0,
-            totalBitsExpected: 0,
-            signalStrength: 0,
-            metadata: null,
-        })
+        setState({ status: 'idle', progress: 0, symbolsReceived: 0, totalSymbolsExpected: 0, signalStrength: 0, metadata: null })
         setDecodedFile(null)
     }, [cleanup])
 
     return {
-        state,
-        decodedFile,
-        analyserNode,
-        micPermission,
-        startListening,
-        stopListening,
-        reset,
-        checkMicrophonePermission,
+        state, decodedFile, analyserNode, micPermission,
+        startListening, stopListening, reset, checkMicrophonePermission,
     }
 }
