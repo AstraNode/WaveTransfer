@@ -185,12 +185,7 @@ export function useAudioReceiver() {
 
         if (result) {
             if (result.checksumValid) {
-                // Fix TS 5.7 Uint8Array<ArrayBufferLike> → Blob issue
-                const buffer = result.data.buffer.slice(
-                    result.data.byteOffset,
-                    result.data.byteOffset + result.data.byteLength
-                )
-                const blob = new Blob([buffer], {
+                const blob = new Blob([result.data as any], {
                     type: result.metadata.type || 'application/octet-stream',
                 })
                 const url = URL.createObjectURL(blob)
