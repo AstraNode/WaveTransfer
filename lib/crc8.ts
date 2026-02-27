@@ -18,7 +18,7 @@ function initCRC8Table(): void {
 
 initCRC8Table()
 
-export function crc8(data: Uint8Array): number {
+export function crc8(data: Uint8Array | number[]): number {
     let crc = 0x00
     for (let i = 0; i < data.length; i++) {
         crc = CRC8_TABLE[(crc ^ data[i]) & 0xff]
